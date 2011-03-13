@@ -4862,8 +4862,8 @@ int sched_setscheduler(struct task_struct *p, int policy,
 EXPORT_SYMBOL_GPL(sched_setscheduler);
 
 int sched_setscheduler_ex(struct task_struct *p, int policy,
-			  const struct sched_param *param,
-			  const struct sched_param_ex *param_ex)
+			  struct sched_param *param,
+			  struct sched_param_ex *param_ex)
 {
 	return __sched_setscheduler(p, policy, param, param_ex, true);
 }
