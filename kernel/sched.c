@@ -5123,6 +5123,25 @@ out_unlock:
 
 }
 
+/**
+ * sys_bwi_give_server - give the (c_s, d_{s,k}) pair to the specified pid
+ * @pid: the pid in question.
+ */
+SYSCALL_DEFINE1(bwi_give_server, pid_t, pid)
+{
+	return 0;
+}
+
+/**
+ * sys_bwi_give_server - take back the given (c_s, d_{s,k}) pair from the
+ * specified pid
+ * @pid: the pid in question.
+ */
+SYSCALL_DEFINE1(bwi_take_back_server, pid_t, pid)
+{
+	return 0;
+}
+
 long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 {
 	cpumask_var_t cpus_allowed, new_mask;

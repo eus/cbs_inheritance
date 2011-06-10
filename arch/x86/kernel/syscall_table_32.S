@@ -343,3 +343,5 @@ ENTRY(sys_call_table)
 	.long sys_sched_setscheduler_ex
 	.long sys_sched_setparam_ex
 	.long sys_sched_getparam_ex
+	.long sys_bwi_give_server
+	.long sys_bwi_take_back_server	/* 345 */

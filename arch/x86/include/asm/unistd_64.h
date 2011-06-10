@@ -675,6 +675,10 @@ __SYSCALL(__NR_sched_setscheduler_ex, sys_sched_setscheduler_ex)
 __SYSCALL(__NR_sched_setparam_ex, sys_sched_setparam_ex)
 #define __NR_sched_getparam_ex			305
 __SYSCALL(__NR_sched_getparam_ex, sys_sched_getparam_ex)
+#define __NR_bwi_give_server			306
+__SYSCALL(__NR_bwi_give_server, sys_bwi_give_server)
+#define __NR_bwi_take_back_server		307
+__SYSCALL(__NR_bwi_take_back_server, sys_bwi_take_back_server)
 
 #ifndef __NO_STUBS
 #define __ARCH_WANT_OLD_READDIR

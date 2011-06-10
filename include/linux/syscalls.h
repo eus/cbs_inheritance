@@ -343,6 +343,8 @@ asmlinkage long sys_sched_get_priority_max(int policy);
 asmlinkage long sys_sched_get_priority_min(int policy);
 asmlinkage long sys_sched_rr_get_interval(pid_t pid,
 					struct timespec __user *interval);
+asmlinkage long sys_bwi_give_server(pid_t to_pid);
+asmlinkage long sys_bwi_take_back_server(pid_t from_pid);
 asmlinkage long sys_setpriority(int which, int who, int niceval);
 asmlinkage long sys_getpriority(int which, int who);
 
