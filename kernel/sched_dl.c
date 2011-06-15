@@ -14,6 +14,11 @@
  *                    Fabio Checconi <fabio@gandalf.sssup.it>
  */
 
+#ifdef CONFIG_SCHED_HRTICK
+/* The following is in nanosecond */
+#define SCHED_HRTICK_SMALLEST 10000
+#endif
+
 static inline int dl_time_before(u64 a, u64 b)
 {
 	return (s64)(a - b) < 0;
@@ -478,10 +483,8 @@ static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
 #ifdef CONFIG_SCHED_HRTICK
 static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
 {
-	s64 delta = p->dl.dl_runtime - p->dl.runtime;
-
-	if (delta > 10000)
-		hrtick_start(rq, delta);
+	if (p->dl.runtime > SCHED_HRTICK_SMALLEST)
+		hrtick_start(rq, p->dl.runtime);
 }
 #else
 static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
