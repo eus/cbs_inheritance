@@ -485,6 +485,10 @@ static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
 {
 	if (p->dl.runtime > SCHED_HRTICK_SMALLEST)
 		hrtick_start(rq, p->dl.runtime);
+	else {
+		replenish_dl_entity(&p->dl);
+		resched_task(p);
+	}
 }
 #else
 static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
