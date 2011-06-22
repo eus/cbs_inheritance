@@ -522,10 +522,7 @@ struct task_struct *pick_next_task_dl(struct rq *rq)
 	BUG_ON(!dl_se);
 
 	p = dl_task_of(dl_se);
-
-	update_rq_clock(rq);
 	p->se.exec_start = rq->clock;
-
 #ifdef CONFIG_SCHED_HRTICK
 	if (hrtick_enabled(rq))
 		start_hrtick_dl(rq, p);
