@@ -2570,6 +2570,15 @@ static void __sched_fork(struct task_struct *p)
 	p->dl.dl_runtime = p->dl.runtime = 0;
 	p->dl.dl_deadline = p->dl.deadline = 0;
 	p->dl.flags = 0;
+	/* Forked CBS is a new CBS with its own queue */
+	INIT_LIST_HEAD(&p->dl.cbs_queue);
+	p->dl.nr_task = 0;
+	INIT_LIST_HEAD(&p->dl.gc_node);
+	p->dl.cbs_rq = task_rq(p);
+	/* Forked CBS task does not belong to any CBS yet */
+	INIT_LIST_HEAD(&p->dl.cbs_membership);
+	p->dl.effective_cbs = NULL;
+	INIT_LIST_HEAD(&p->dl.cbs_gc_list);
 
 	INIT_LIST_HEAD(&p->rt.run_list);
 	p->se.on_rq = 0;
@@ -4617,11 +4626,20 @@ static struct task_struct *find_process_by_pid(pid_t pid)
 	return pid ? find_task_by_vpid(pid) : current;
 }
 
+extern void associate_task_and_its_cbs(struct task_struct *p);
+extern void disassociate_task_and_its_cbs(struct task_struct *p);
+
 /* Actually do priority change: must hold rq lock. */
 static void
 __setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
 {
 	BUG_ON(p->se.on_rq);
+
+	if (dl_policy(p->policy) && !dl_policy(policy)) {
+		disassociate_task_and_its_cbs(p);
+	} else if (!dl_policy(p->policy) && dl_policy(policy)) {
+		associate_task_and_its_cbs(p);
+	}
 
 	p->policy = policy;
 	p->rt_priority = prio;

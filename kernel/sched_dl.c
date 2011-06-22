@@ -12,6 +12,10 @@
  * Copyright (C) 2010 Dario Faggioli <raistlin@linux.it>,
  *                    Michael Trimarchi <trimarchimichael@yahoo.it>,
  *                    Fabio Checconi <fabio@gandalf.sssup.it>
+ * Copyright (C) 2011 Tadeus Prastowo <eus@member.fsf.org>
+ *
+ * CAUTION: Unless otherwise mentioned, all functions in this file expect the
+ * runqueue lock to be held and irq is disabled (i.e., no preemption too).
  */
 
 #ifdef CONFIG_SCHED_HRTICK
@@ -24,6 +28,7 @@ static inline int dl_time_before(u64 a, u64 b)
 	return (s64)(a - b) < 0;
 }
 
+/* Return the task that hosts the CBS. */
 static inline struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
 {
 	return container_of(dl_se, struct task_struct, dl);
@@ -48,9 +53,260 @@ static inline int on_dl_rq(struct sched_dl_entity *dl_se)
 }
 
 static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
-static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags);
-static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
-				  int flags);
+static void enqueue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags);
+static void dequeue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags);
+static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
+				   int flags);
+
+/* Iterate the membership list of a task. */
+#define cbs_membership_for_each(pos, p)				\
+	list_for_each_entry(pos, &p->dl.cbs_membership, node)
+
+/* Iterate the membership list of a task safe against membership removal. */
+#define cbs_membership_for_each_safe(pos, n, p)				\
+	list_for_each_entry_safe(pos, n, &p->dl.cbs_membership, node)
+
+/* Return the task's effective CBS. */
+static inline struct sched_dl_entity *effective_cbs(struct task_struct *p)
+{
+	return p->dl.effective_cbs;
+}
+
+/* Set the task's effective CBS. */
+static inline void set_effective_cbs(struct task_struct *p,
+				     struct sched_dl_entity *effective_cbs)
+{
+	p->dl.effective_cbs = effective_cbs;
+}
+
+/* Nullify the task's effective CBS. */
+static inline void zap_effective_cbs(struct task_struct *p)
+{
+	p->dl.effective_cbs = NULL;
+}
+
+/* Increment the CBS refcount. */
+static inline void get_cbs(struct sched_dl_entity *cbs)
+{
+	if (cbs->nr_task == 0
+	    && !list_empty(&current->dl.cbs_gc_list)
+	    && list_first_entry(&current->dl.cbs_gc_list,
+				struct sched_dl_entity, gc_node) == cbs) {
+		/*
+		 * Current goes from SCHED_DL to ~SCHED_DL and back
+		 * to SCHED_DL
+		 */
+		list_del_init(current->dl.cbs_gc_list.next);
+	} else
+		get_task_struct(dl_task_of(cbs));
+
+	cbs->nr_task++;
+}
+
+/*
+ * Decrement the CBS refcount. If the refcount is zero, the CBS should be
+ * assumed to have been destroyed.
+ */
+static inline void put_cbs(struct sched_dl_entity *cbs)
+{
+	BUG_ON(cbs->nr_task == 0);
+
+	cbs->nr_task--;
+
+	if (cbs->nr_task == 0
+	    && hrtimer_active(&cbs->dl_timer)
+	    && hrtimer_try_to_cancel(&cbs->dl_timer) == -1)
+		if (cbs == &current->dl)
+			list_add(&cbs->gc_node, &current->dl.cbs_gc_list);
+		else
+			list_add_tail(&cbs->gc_node, &current->dl.cbs_gc_list);
+	else
+		put_task_struct(dl_task_of(cbs));
+}
+
+/*
+ * Return a task at the head of the CBS queue. If the queue is empty,
+ * NULL is returned.
+ */
+static struct task_struct *cbs_queue_head(struct sched_dl_entity *cbs)
+{
+	if (list_empty(&cbs->cbs_queue))
+		return NULL;
+
+	return list_first_entry(&cbs->cbs_queue, struct cbs_queue_entry,
+				node)->task;
+}
+
+/*
+ * Return non-zero if the CBS queue is empty. Otherwise, return zero.
+ */
+static inline int cbs_queue_empty(struct sched_dl_entity *cbs)
+{
+	return list_empty(&cbs->cbs_queue);
+}
+
+/*
+ * Enqueue a task to the CBS queue. This will add an entry to the CBS queue.
+ */
+static struct cbs_queue_entry *cbs_enqueue(struct task_struct *p,
+					   struct sched_dl_entity *cbs)
+{
+	struct cbs_queue_entry *queue_entry;
+	queue_entry = kmalloc(sizeof(*queue_entry), GFP_ATOMIC);
+
+	queue_entry->task = p;
+	list_add_tail(&queue_entry->node, &cbs->cbs_queue);
+
+	return queue_entry;
+}
+
+/*
+ * Dequeue a task from the CBS queue. This will delete an entry from
+ * the CBS queue.
+ */
+static void cbs_dequeue(struct cbs_queue_entry *entry,
+			struct sched_dl_entity *cbs)
+{
+	list_del(&entry->node);
+	kfree(entry);
+}
+
+/* Add a CBS membership entry to a task's CBS membership list. */
+static struct cbs_membership_entry *
+cbs_membership_add(struct sched_dl_entity *cbs, struct task_struct *p,
+		   int to_head)
+{
+	struct cbs_membership_entry *membership_entry;
+	membership_entry = kmalloc(sizeof(*membership_entry), GFP_ATOMIC);
+
+	membership_entry->cbs = cbs;
+	membership_entry->entry_at_cbs = NULL;
+	if (to_head)
+		list_add(&membership_entry->node, &p->dl.cbs_membership);
+	else
+		list_add_tail(&membership_entry->node, &p->dl.cbs_membership);
+
+	return membership_entry;
+}
+
+/* Delete a CBS membership entry from a task's CBS membership list. */
+static void cbs_membership_del(struct cbs_membership_entry *membership,
+			       struct task_struct *p)
+{
+	BUG_ON(membership->entry_at_cbs != NULL);
+
+	list_del(&membership->node);
+	kfree(membership);
+}
+
+/*
+ * Return the first entry of the membership list. NULL is returned if
+ * the membership list is empty.
+ */
+static inline struct cbs_membership_entry *
+cbs_membership_first(struct task_struct *p)
+{
+	struct list_head *hd = &p->dl.cbs_membership;
+
+	if (list_empty(hd))
+		return NULL;
+
+	return list_first_entry(hd, struct cbs_membership_entry, node);
+}
+
+/*
+ * Return the last entry added to the membership list. NULL is
+ * returned if the membership list is empty.
+ */
+static inline struct cbs_membership_entry *
+cbs_membership_last(struct task_struct *p)
+{
+	struct list_head *hd = &p->dl.cbs_membership;
+
+	if (list_empty(hd))
+		return NULL;
+
+	return list_entry(hd->prev, struct cbs_membership_entry, node);
+}
+
+/* Return non-zero if the CBS membership entry of a task is empty. */
+static inline void cbs_membership_empty(struct task_struct *p)
+{
+	list_empty(&p->dl.cbs_membership);
+}
+
+/*
+ * Make a task eligible to run on a CBS. This will add an element to the task's
+ * CBS membership list.
+ */
+static void associate_task_and_cbs(struct task_struct *p,
+				   struct sched_dl_entity *cbs)
+{
+	get_cbs(cbs);
+	cbs_membership_add(cbs, p, 0);
+}
+
+/*
+ * Make a task ineligible to run on a CBS on which the task was eligible to.
+ * This will delete an element from the task's CBS membership list.
+ */
+static void disassociate_task_and_cbs(struct task_struct *p,
+				      struct cbs_membership_entry *membership)
+{
+	struct sched_dl_entity *cbs = membership->cbs;
+	cbs_membership_del(membership, p);
+	put_cbs(cbs);
+}
+
+/* 
+ * Make a task ineligible to run on all CBSes on which the task was eligible
+ * to. This will delete all elements from the task's CBS membership list.
+ */
+static void disassociate_task_and_all_cbs(struct task_struct *p)
+{
+	struct cbs_membership_entry *membership, *next;
+
+	cbs_membership_for_each_safe(membership, next, p) {
+		disassociate_task_and_cbs(p, membership);
+	}
+}
+
+void associate_task_and_its_cbs(struct task_struct *p)
+{
+	struct sched_dl_entity *cbs = &p->dl;
+
+	get_cbs(cbs);
+	cbs_membership_add(cbs, p, 1);
+}
+
+void disassociate_task_and_its_cbs(struct task_struct *p)
+{
+	struct cbs_membership_entry *membership = cbs_membership_first(p);
+	struct sched_dl_entity *cbs = &p->dl;
+
+	BUG_ON(cbs != membership->cbs);
+
+	cbs_membership_del(membership, p);
+	put_cbs(cbs);
+}
+
+static inline struct rq *cbs_rq_lock(struct sched_dl_entity *cbs,
+				     unsigned long *flags)
+	__acquires(rq->lock)
+{
+	struct rq *rq = cbs->cbs_rq;
+
+	raw_spin_lock_irqsave(&rq->lock, *flags);
+
+	return rq;
+}
+
+static inline void cbs_rq_unlock(struct rq *rq,
+				 unsigned long *flags)
+	__releases(rq->lock)
+{
+	raw_spin_unlock_irqrestore(&rq->lock, *flags);
+}
 
 /*
  * We are being explicitly informed that a new instance is starting,
@@ -238,7 +494,7 @@ static int start_dl_timer(struct sched_dl_entity *dl_se)
 
 /*
  * This is the bandwidth enforcement timer callback. If here, we know
- * a task is not on its dl_rq, since the fact that the timer was running
+ * a CBS is not on its dl_rq, since the fact that the timer was running
  * means the task is throttled and needs a runtime replenishment.
  *
  * However, what we actually do depends on the fact the task is active,
@@ -248,6 +504,12 @@ static int start_dl_timer(struct sched_dl_entity *dl_se)
  * do nothing but clearing dl_throttled, so that runtime and deadline
  * updating (and the queueing back to dl_rq) will be done by the
  * next call to enqueue_task_dl().
+ *
+ * This function can run from either one of the following contexts:
+ * - hard-IRQ (irq is disabled and so is preemption)
+ * - soft-IRQ
+ *
+ * - rq lock is not held.
  */
 static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
 {
@@ -255,24 +517,22 @@ static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
 	struct sched_dl_entity *dl_se = container_of(timer,
 						     struct sched_dl_entity,
 						     dl_timer);
-	struct task_struct *p = dl_task_of(dl_se);
-	struct rq *rq = task_rq_lock(p, &flags);
+	struct rq *rq = cbs_rq_lock(dl_se, &flags);
 
 	/*
 	 * We need to take care of a possible races here. In fact, the
-	 * task might have changed its scheduling policy to something
-	 * different from SCHED_DEADLINE (through sched_setscheduler()).
+	 * CBS might have been destroyed.
 	 */
-	if (!dl_task(p))
+	if (dl_se->nr_task == 0)
 		goto unlock;
 
 	dl_se->dl_throttled = 0;
-	if (p->se.on_rq) {
-		enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
-		check_preempt_curr_dl(rq, p, 0);
+	if (!cbs_queue_empty(dl_se)) {
+		enqueue_cbs(rq, dl_se, ENQUEUE_REPLENISH);
+		check_preempt_curr_cbs(rq, dl_se, 0);
 	}
 unlock:
-	task_rq_unlock(rq, &flags);
+	cbs_rq_unlock(rq, &flags);
 
 	return HRTIMER_NORESTART;
 }
@@ -320,7 +580,7 @@ int dl_runtime_exceeded(struct rq *rq, struct sched_dl_entity *dl_se)
 static void update_curr_dl(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	struct sched_dl_entity *dl_se = &curr->dl;
+	struct sched_dl_entity *dl_se = effective_cbs(curr);
 	u64 delta_exec;
 
 	if (!dl_task(curr) || !on_dl_rq(dl_se))
@@ -341,11 +601,11 @@ static void update_curr_dl(struct rq *rq)
 
 	dl_se->runtime -= delta_exec;
 	if (dl_runtime_exceeded(rq, dl_se)) {
-		__dequeue_task_dl(rq, curr, 0);
+		dequeue_cbs(rq, dl_se, 0);
 		if (0 && likely(start_dl_timer(dl_se)))
 			dl_se->dl_throttled = 1;
 		else
-			enqueue_task_dl(rq, curr, ENQUEUE_REPLENISH);
+			enqueue_cbs(rq, dl_se, ENQUEUE_REPLENISH);
 
 		resched_task(curr);
 	}
@@ -424,29 +684,58 @@ static void dequeue_dl_entity(struct sched_dl_entity *dl_se)
 	__dequeue_dl_entity(dl_se);
 }
 
-static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+static void enqueue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
 {
 	/*
-	 * If p is throttled, we do nothing. In fact, if it exhausted
+	 * If cbs is throttled, we do nothing. In fact, if it exhausted
 	 * its budget it needs a replenishment and, since it now is on
 	 * its rq, the bandwidth timer callback (which clearly has not
 	 * run yet) will take care of this.
 	 */
-	if (p->dl.dl_throttled)
+	if (cbs->dl_throttled)
 		return;
 
-	enqueue_dl_entity(&p->dl, flags);
+	enqueue_dl_entity(cbs, flags);
 }
 
-static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
-	dequeue_dl_entity(&p->dl);
+	struct cbs_membership_entry *membership;
+
+	cbs_membership_for_each(membership, p) {
+		struct sched_dl_entity *cbs = membership->cbs;
+
+		membership->entry_at_cbs = cbs_enqueue(p, cbs);
+
+		if (!on_dl_rq(cbs))
+			enqueue_cbs(rq, cbs, flags);
+	}
+}
+
+static void dequeue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
+{
+	dequeue_dl_entity(cbs);
 }
 
 static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
+	struct cbs_membership_entry *membership;
+
 	update_curr_dl(rq);
-	__dequeue_task_dl(rq, p, flags);
+
+	cbs_membership_for_each(membership, p) {
+		struct sched_dl_entity *cbs = membership->cbs;
+
+		cbs_dequeue(membership->entry_at_cbs, cbs);
+		membership->entry_at_cbs = NULL;
+
+		if (cbs_queue_empty(cbs))
+			dequeue_cbs(rq, cbs, flags);
+	}
+
+	if (unlikely(p->state == TASK_DEAD)) {
+		disassociate_task_and_all_cbs(p);
+	}
 }
 
 /*
@@ -454,10 +743,16 @@ static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
  *
  *   get off from the CPU until our next instance, with
  *   a new runtime.
+ *
+ * But, when the original CBS replenishment behavior is used, the
+ * semantic of yield task becomes:
+ *
+ *   postpone the deadline and have a new runtime without getting off
+ *   from the CPU.
  */
 static void yield_task_dl(struct rq *rq)
 {
-	struct task_struct *p = rq->curr;
+	struct sched_dl_entity *cbs = effective_cbs(rq->curr);
 
 	/*
 	 * We make the task go to sleep until its current deadline by
@@ -465,28 +760,61 @@ static void yield_task_dl(struct rq *rq)
 	 * it and the bandwidth timer will wake it up and will give it
 	 * new scheduling parameters (thanks to dl_new=1).
 	 */
-	if (p->dl.runtime > 0) {
-		rq->curr->dl.dl_new = 1;
-		p->dl.runtime = 0;
+	if (cbs->runtime > 0) {
+		cbs->dl_new = 1;
+		cbs->runtime = 0;
 	}
 	update_curr_dl(rq);
+}
+
+static inline int should_preempt_curr(struct task_struct *curr,
+				      struct sched_dl_entity *cbs)
+{
+	return (!dl_task(curr)
+		|| (dl_time_before(cbs->deadline,
+				   effective_cbs(curr)->deadline)
+		    && effective_cbs(curr) != cbs));
+}
+
+static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
+				   int flags)
+{
+	if (should_preempt_curr(rq->curr, cbs))
+		resched_task(rq->curr);
 }
 
 static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
 				  int flags)
 {
-	if (!dl_task(rq->curr) || (dl_task(p) &&
-	    dl_time_before(p->dl.deadline, rq->curr->dl.deadline)))
-		resched_task(rq->curr);
+	struct cbs_membership_entry *membership;
+
+	if (!dl_task(p))
+		return;
+
+	cbs_membership_for_each(membership, p) {
+		struct sched_dl_entity *cbs = membership->cbs;
+
+		if (cbs->dl_throttled
+		    || membership->entry_at_cbs == NULL /* p can't use this */
+		    || cbs_queue_head(cbs) != p)
+			continue;
+
+		if (should_preempt_curr(rq->curr, cbs)) {
+			resched_task(rq->curr);
+			break;
+		}
+	}
 }
 
 #ifdef CONFIG_SCHED_HRTICK
 static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
 {
-	if (p->dl.runtime > SCHED_HRTICK_SMALLEST)
-		hrtick_start(rq, p->dl.runtime);
+	struct sched_dl_entity *cbs = effective_cbs(p);
+
+	if (cbs->runtime > SCHED_HRTICK_SMALLEST)
+		hrtick_start(rq, cbs->runtime);
 	else {
-		replenish_dl_entity(&p->dl);
+		replenish_dl_entity(cbs);
 		resched_task(p);
 	}
 }
@@ -521,7 +849,11 @@ struct task_struct *pick_next_task_dl(struct rq *rq)
 	dl_se = pick_next_dl_entity(rq, dl_rq);
 	BUG_ON(!dl_se);
 
-	p = dl_task_of(dl_se);
+	p = cbs_queue_head(dl_se);
+	BUG_ON(p == NULL);
+
+	set_effective_cbs(p, dl_se);
+
 	p->se.exec_start = rq->clock;
 #ifdef CONFIG_SCHED_HRTICK
 	if (hrtick_enabled(rq))
@@ -534,6 +866,7 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
 {
 	update_curr_dl(rq);
 	p->se.exec_start = 0;
+	zap_effective_cbs(p);
 }
 
 static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
@@ -541,13 +874,23 @@ static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
 	update_curr_dl(rq);
 
 #ifdef CONFIG_SCHED_HRTICK
-	if (hrtick_enabled(rq) && queued && p->dl.runtime > 0)
+	if (hrtick_enabled(rq) && queued && effective_cbs(p)->runtime > 0)
 		start_hrtick_dl(rq, p);
 #endif
 }
 
+/*
+ * - rq->lock is not held
+ * - interrupt is not disabled
+ * - preemption is disabled due to fn get_cpu in fn sched_fork
+ *
+ * - p is not yet in the runqueue
+ */
 static void task_fork_dl(struct task_struct *p)
 {
+	struct rq *rq = this_rq();
+	unsigned long flags;
+
 	/*
 	 * The child of a -deadline task will be SCHED_DEADLINE, but
 	 * as a throttled task. This means the parent (or someone else)
@@ -556,15 +899,42 @@ static void task_fork_dl(struct task_struct *p)
 	 */
 	p->dl.dl_throttled = 1;
 	p->dl.dl_new = 0;
+
+	raw_spin_lock_irqsave(&rq->lock, flags);
+	associate_task_and_its_cbs(p);
+	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
 
+/*
+ * - must be called from task_dead scheduling interface callback
+ * - rq->lock must *not* be held
+ */
+void run_cbs_gc(struct task_struct *p)
+{
+	struct sched_dl_entity *cbs;
+
+	/*
+	 * No need to modify the link list since the list will be destroyed
+	 * along with the task.
+	 */
+	list_for_each_entry(cbs, &p->dl.cbs_gc_list, gc_node) {
+		hrtimer_cancel(&cbs->dl_timer);
+		put_task_struct(dl_task_of(cbs));
+	}
+}
+
+/*
+ * - rq->lock is not held
+ * - interrupt is not disabled
+ * - preemption is not disabled
+ */
 static void task_dead_dl(struct task_struct *p)
 {
 	/*
 	 * We are not holding any lock here, so it is safe to
 	 * wait for the bandwidth timer to be removed.
 	 */
-	hrtimer_cancel(&p->dl.dl_timer);
+	run_cbs_gc(p);
 }
 
 static void set_curr_task_dl(struct rq *rq)
@@ -572,26 +942,35 @@ static void set_curr_task_dl(struct rq *rq)
 	struct task_struct *p = rq->curr;
 
 	p->se.exec_start = rq->clock;
+
+	/*
+	 * This can only be invoked from either __sched_setscheduler or
+	 * rt_mutex_setprio. For the former case, there are two
+	 * possibilities:
+	 *
+	 * Possibility I: curr switches from ~SCHED_DL to SCHED_DL (i.e.,
+	 * activating its own CBS). In this case, curr does not have an
+	 * effective CBS unless curr is running on another CBS under
+	 * bandwidth inheritance. When curr has no effective CBS, curr's
+	 * effective CBS should be set to its own CBS.
+	 *
+	 * Possibility II: curr adjusts its CBS bandwidth (from SCHED_DL to
+	 * SCHED_DL). In this case, curr already has an effective CBS.
+	 *
+	 * For the latter case, currently it is not considered yet.
+	 */
+	if (effective_cbs(p) == NULL)
+		set_effective_cbs(p, &p->dl);
 }
 
 static void switched_from_dl(struct rq *rq, struct task_struct *p,
 			     int running)
 {
-	if (hrtimer_active(&p->dl.dl_timer))
-		hrtimer_try_to_cancel(&p->dl.dl_timer);
 }
 
 static void switched_to_dl(struct rq *rq, struct task_struct *p,
 			   int running)
 {
-	/*
-	 * If p is throttled, don't consider the possibility
-	 * of preempting rq->curr, the check will be done right
-	 * after its runtime will get replenished.
-	 */
-	if (unlikely(p->dl.dl_throttled))
-		return;
-
 	if (!running)
 		check_preempt_curr_dl(rq, p, 0);
 }

@@ -1221,8 +1221,47 @@ struct sched_rt_entity {
 };
 
 struct sched_dl_entity {
+	/* BIG FAT WARNING: The relationship between CBS and CBS task is not  */
+	/*                  yet SMP-safe. Currently Tadeus only considers UP  */
+	/*                  where it can be assumed that only one CBS can be  */
+	/*                  running at any instant of time although the       */
+	/*                  comments may mention desired SMP behaviors.       */
+	/*                  This implies that CPU affinity is not thought     */
+	/*                  about.                                            */
+	/*                  This also implies that there is only one rq and   */
+	/*                  code related to rq selection always return this   */
+	/*                  rq.                                               */
+
+	/* -- 8< -- CBS ----------------------------------------------------- */
+	/* - One CBS can serve many tasks.                                    */
+	/* - A CBS is completely decoupled from the task_struct hosting it.   */
+	/* - A CBS is created when a task use fn sched_setscheduler to get    */
+	/*   scheduled using SCHED_DEADLINE.                                  */
+	/* - A CBS is destroyed when there is no more task that can be        */
+	/*   enqueued to the CBS.                                             */
+	/* - Tasks using a CBS is enqueued in FIFO order.                     */
+	/* - A CBS server is scheduled using EDF scheduling algorithm.        */
+	/* - A CBS server runs the task at the head of the FIFO queue when    */
+	/*   the CBS server gets scheduled by the EDF scheduling algorithm.   */
+	/* - A task can enter the FIFO queue when it calls fn enqueue_task    */
+	/*   through fn schedule (e.g., when a task unblocks or forked).      */
+	/* - A task can leave the FIFO queue if it calls fn dequeue_task      */
+	/*   through fn schedule (e.g., when a task blocks or dies).          */
+	/* - A unique task can be enqueued in many CBSes but when the task is */
+	/*   at the heads of more than one CBS that can run in parallel each  */
+	/*   in a different CPU, only one CBS will be able to run the task    */
+	/*   while the other CBSes will requeue the task.                     */
+	/* - Food for thought:                                                */
+	/*   Assuming that in SMP consisting of M CPUs means that M earliest  */
+	/*   CBS should be run, when task A in CPU 1 gives its bandwidth to   */
+	/*   task B in CPU 2, if task B is then run on CPU 1, this will       */
+	/*   invalidate task B's hot cache not to mention affinity            */
+	/*   restriction that task B has. If the CBS of task A is dequeued    */
+	/*   from CPU 1 and enqueued on CPU 2, then perhaps the CBS cannot    */
+	/*   immediately run on CPU 2 if the deadline is later than the CBS   */
+	/*   currently executing on CPU 2 although the CBS can run on CPU 1.  */
+
 	struct rb_node	rb_node;
-	int nr_cpus_allowed;
 
 	/*
 	 * Original scheduling parameters. Copied here from sched_param_ex
@@ -1259,6 +1298,91 @@ struct sched_dl_entity {
 	 * own bandwidth to be enforced, thus we need one timer per task.
 	 */
 	struct hrtimer dl_timer;
+
+	/*
+	 * The CBS FIFO queue. The head of the queue is the task to be served
+	 * when this CBS runs. If there is no queued task, this CBS is dequeued
+	 * from the EDF runqueue (struct dl_rq). Otherwise, this CBS will
+	 * always be in the EDF runqueue.
+	 */
+	struct list_head cbs_queue;
+
+	/*
+	 * Once this hits zero, this CBS should be cleaned up because there is
+	 * no way for any other task to use this CBS. The only way this number
+	 * can increase is when a member of this CBS gives this CBS to another
+	 * task.
+	 */
+	int nr_task;
+
+	/*
+	 * When hard CBS replenishment behavior is in use (i.e., dl_task_timer
+	 * can be executed), the dl_timer must be defused outside fn
+	 * dl_task_timer and without holding rq->lock because fn dl_task_timer
+	 * itself wants to grab rq->lock. Since the task_struct hosting this
+	 * CBS server may have died before the nr_task of this CBS is zero,
+	 * when the nr_task is zero, put_cbs will likely free the task_struct
+	 * while dl_timer is still running. Fn put_cbs itself cannot wait for
+	 * the completion of fn dl_task_timer before freeing the task_struct
+	 * because put_cbs is executed while holding the rq->lock (i.e.,
+	 * put_cbs will deadlock if it waits for dl_task_timer). Therefore,
+	 * put_cbs will enqueue this CBS to its last task user so that the CBS
+	 * can be freed while not holding rq->lock.
+	 */
+	struct list_head gc_node;
+
+	/*
+	 * The rq whose rq->lock will protect this CBS.
+	 */
+	struct rq *cbs_rq;
+	/* -- 8< -- End of CBS ---------------------------------------------- */
+
+	/* -- 8< -- CBS task ------------------------------------------------ */
+	/* - A CBS task is defined as a task that is associated with (i.e.,   */
+	/*   can be enqueued to) at least one CBS. This means that even a CFS */
+	/*   task can be a CBS task, for example, under bandwidth inheritance.*/
+	/* - One CBS task can be eligible to run on many CBSes.               */
+	/* - But, one CBS task can run using only one CBS.                    */
+	/* - A SCHED_DEADLINE task is always associated with the CBS that     */
+	/*   the task hosts.                                                  */
+
+	int nr_cpus_allowed;
+
+	/*
+	 * List of CBSes that this DL task is a member of.
+	 */
+	struct list_head cbs_membership;
+
+	/*
+	 * The CBS existing in cbs_membership that this task is using for
+	 * running. That is, effective_cbs is NULL if this task is not the
+	 * rq->curr of any rq.
+	 */
+	struct sched_dl_entity *effective_cbs;
+
+	/*
+	 * This list contains CBSes that should be destroyed without holding
+	 * rq->lock and by using fn hrtimer_cancel to defuse its dl_timer.
+	 */
+	struct list_head cbs_gc_list;
+	/* -- 8< -- End of CBS task ----------------------------------------- */
+
+	/*
+	 * NOTE: cbs_queue, nr_task, cbs_membership and effective_cbs are the
+	 * fields that should be made SMP safe when a task can be enqueued in
+	 * CBSes that are enqueued in the dl_rqs of other CPUs.
+	 */
+};
+
+struct cbs_queue_entry {
+	struct list_head node;
+	struct task_struct *task;
+};
+
+struct cbs_membership_entry {
+	struct list_head node;
+	struct sched_dl_entity *cbs;
+	struct cbs_queue_entry *entry_at_cbs;
 };
 
 struct rcu_node;

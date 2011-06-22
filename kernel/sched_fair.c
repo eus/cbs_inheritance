@@ -3774,6 +3774,13 @@ static void task_fork_fair(struct task_struct *p)
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
 
+extern void run_cbs_gc(struct task_struct *p);
+
+static void task_dead_fair(struct task_struct *p)
+{
+	run_cbs_gc(p);
+}
+
 /*
  * Priority of the task has changed. Check to see if we preempt
  * the current task.
@@ -3875,6 +3882,7 @@ static const struct sched_class fair_sched_class = {
 	.set_curr_task          = set_curr_task_fair,
 	.task_tick		= task_tick_fair,
 	.task_fork		= task_fork_fair,
+	.task_dead		= task_dead_fair,
 
 	.prio_changed		= prio_changed_fair,
 	.switched_to		= switched_to_fair,

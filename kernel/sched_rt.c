@@ -1710,6 +1710,13 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	}
 }
 
+extern void run_cbs_gc(struct task_struct *p);
+
+static void task_dead_rt(struct task_struct *p)
+{
+	run_cbs_gc(p);
+}
+
 static void set_curr_task_rt(struct rq *rq)
 {
 	struct task_struct *p = rq->curr;
@@ -1756,6 +1763,7 @@ static const struct sched_class rt_sched_class = {
 
 	.set_curr_task          = set_curr_task_rt,
 	.task_tick		= task_tick_rt,
+	.task_dead		= task_dead_rt,
 
 	.get_rr_interval	= get_rr_interval_rt,
 
