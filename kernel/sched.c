@@ -2575,8 +2575,9 @@ static void __sched_fork(struct task_struct *p)
 	p->dl.nr_task = 0;
 	INIT_LIST_HEAD(&p->dl.gc_node);
 	p->dl.cbs_rq = task_rq(p);
-	/* Forked CBS task does not belong to any CBS yet */
+	/* Forked CBS task does not belong to any CBS yet and not under BWI */
 	INIT_LIST_HEAD(&p->dl.cbs_membership);
+	INIT_LIST_HEAD(&p->dl.bwi_history);
 	p->dl.effective_cbs = NULL;
 	INIT_LIST_HEAD(&p->dl.cbs_gc_list);
 
@@ -5144,20 +5145,53 @@ out_unlock:
 /**
  * sys_bwi_give_server - give the (c_s, d_{s,k}) pair to the specified pid
  * @pid: the pid in question.
+ * @key: the key of the inheritance entry for taking back the given server.
  */
-SYSCALL_DEFINE1(bwi_give_server, pid_t, pid)
+SYSCALL_DEFINE2(bwi_give_server, pid_t, pid, int __user *, key)
 {
-	return 0;
+	struct task_struct *p;
+	int hist_key, retval;
+	struct rq *rq;
+	unsigned long flags;
+
+	rcu_read_lock();
+	p = find_process_by_pid(pid);
+	retval = -ESRCH;
+	if (!p)
+		goto out_unlock;
+
+	rq = task_rq_lock(current, &flags);
+	retval = bwi_give_server(current, p, &hist_key);
+	task_rq_unlock(rq, &flags);
+	rcu_read_unlock();
+
+	if (retval == 0)
+		return (copy_to_user(key, &hist_key, sizeof(hist_key))
+			? -EFAULT : 0);
+
+	return retval;
+
+out_unlock:
+	rcu_read_unlock();
+	return retval;
 }
 
 /**
  * sys_bwi_give_server - take back the given (c_s, d_{s,k}) pair from the
- * specified pid
- * @pid: the pid in question.
+ * task referred by the key of the inheritance entry.
+ * @key: the key in question.
  */
-SYSCALL_DEFINE1(bwi_take_back_server, pid_t, pid)
+SYSCALL_DEFINE1(bwi_take_back_server, int, key)
 {
-	return 0;
+	int retval;
+	unsigned long flags;
+	struct rq *rq;
+
+	rq = task_rq_lock(current, &flags);
+	retval = bwi_take_back_server(current, key);
+	task_rq_unlock(rq, &flags);
+
+	return retval;
 }
 
 long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)

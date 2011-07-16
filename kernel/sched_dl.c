@@ -66,6 +66,25 @@ static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
 #define cbs_membership_for_each_safe(pos, n, p)				\
 	list_for_each_entry_safe(pos, n, &p->dl.cbs_membership, node)
 
+/* Iterate backward the membership list of a task. */
+#define cbs_membership_for_each_reverse(pos, p)				\
+	list_for_each_entry_reverse(pos, &p->dl.cbs_membership, node)
+
+/* Iterate the BWI history list of a task. */
+#define bwi_history_for_each(pos, p)				\
+	list_for_each_entry(pos, &p->dl.bwi_history, node)
+
+/* Iterate the BWI history list of a task safe against entry removal. */
+#define bwi_history_for_each_safe(pos, n, p)				\
+	list_for_each_entry_safe(pos, n, &p->dl.bwi_history, node)
+
+/* Return non-zero if the CBS is the task's hosted CBS. */
+static inline int task_hosts_cbs(struct task_struct *p,
+				 struct sched_dl_entity *dl_se)
+{
+	return (p == dl_task_of(dl_se));
+}
+
 /* Return the task's effective CBS. */
 static inline struct sched_dl_entity *effective_cbs(struct task_struct *p)
 {
@@ -116,7 +135,7 @@ static inline void put_cbs(struct sched_dl_entity *cbs)
 	if (cbs->nr_task == 0
 	    && hrtimer_active(&cbs->dl_timer)
 	    && hrtimer_try_to_cancel(&cbs->dl_timer) == -1)
-		if (cbs == &current->dl)
+		if (task_hosts_cbs(current, cbs))
 			list_add(&cbs->gc_node, &current->dl.cbs_gc_list);
 		else
 			list_add_tail(&cbs->gc_node, &current->dl.cbs_gc_list);
@@ -181,6 +200,9 @@ cbs_membership_add(struct sched_dl_entity *cbs, struct task_struct *p,
 
 	membership_entry->cbs = cbs;
 	membership_entry->entry_at_cbs = NULL;
+	INIT_LIST_HEAD(&membership_entry->downstreams);
+	INIT_LIST_HEAD(&membership_entry->downstream_node);
+	INIT_LIST_HEAD(&membership_entry->chain_node);
 	if (to_head)
 		list_add(&membership_entry->node, &p->dl.cbs_membership);
 	else
@@ -190,10 +212,13 @@ cbs_membership_add(struct sched_dl_entity *cbs, struct task_struct *p,
 }
 
 /* Delete a CBS membership entry from a task's CBS membership list. */
-static void cbs_membership_del(struct cbs_membership_entry *membership,
-			       struct task_struct *p)
+static void cbs_membership_del(struct cbs_membership_entry *membership)
 {
 	BUG_ON(membership->entry_at_cbs != NULL);
+
+	BUG_ON(!list_empty(&membership->downstreams));
+	BUG_ON(!list_empty(&membership->downstream_node));
+	BUG_ON(!list_empty(&membership->chain_node));
 
 	list_del(&membership->node);
 	kfree(membership);
@@ -230,20 +255,20 @@ cbs_membership_last(struct task_struct *p)
 }
 
 /* Return non-zero if the CBS membership entry of a task is empty. */
-static inline void cbs_membership_empty(struct task_struct *p)
+static inline int cbs_membership_empty(struct task_struct *p)
 {
-	list_empty(&p->dl.cbs_membership);
+	return list_empty(&p->dl.cbs_membership);
 }
 
 /*
  * Make a task eligible to run on a CBS. This will add an element to the task's
  * CBS membership list.
  */
-static void associate_task_and_cbs(struct task_struct *p,
-				   struct sched_dl_entity *cbs)
+static struct cbs_membership_entry *
+associate_task_and_cbs(struct task_struct *p, struct sched_dl_entity *cbs)
 {
 	get_cbs(cbs);
-	cbs_membership_add(cbs, p, 0);
+	return cbs_membership_add(cbs, p, 0);
 }
 
 /*
@@ -254,7 +279,11 @@ static void disassociate_task_and_cbs(struct task_struct *p,
 				      struct cbs_membership_entry *membership)
 {
 	struct sched_dl_entity *cbs = membership->cbs;
-	cbs_membership_del(membership, p);
+
+	list_del_init(&membership->downstream_node);
+	list_del_init(&membership->chain_node);
+
+	cbs_membership_del(membership);
 	put_cbs(cbs);
 }
 
@@ -271,12 +300,31 @@ static void disassociate_task_and_all_cbs(struct task_struct *p)
 	}
 }
 
+static void
+bwi_give_server_direct(struct task_struct *parent,
+		       struct bwi_history_entry *parent_hist_entry,
+		       struct cbs_membership_entry *parent_membership,
+		       struct task_struct *direct_desc);
+static void bwi_give_server_indirect(struct task_struct *direct_desc,
+				     int count);
+
 void associate_task_and_its_cbs(struct task_struct *p)
 {
+	struct cbs_membership_entry *membership;
+	struct bwi_history_entry *hist_entry;
 	struct sched_dl_entity *cbs = &p->dl;
 
 	get_cbs(cbs);
-	cbs_membership_add(cbs, p, 1);
+	membership = cbs_membership_add(cbs, p, 1);
+
+	bwi_history_for_each(hist_entry, p) {
+		if (!hist_entry->has_inherited_hosted_cbs) {
+			bwi_give_server_direct(p, hist_entry, membership,
+					       hist_entry->desc);
+			bwi_give_server_indirect(hist_entry->desc, 1);
+			hist_entry->has_inherited_hosted_cbs = 1;
+		}
+	}
 }
 
 void disassociate_task_and_its_cbs(struct task_struct *p)
@@ -286,7 +334,7 @@ void disassociate_task_and_its_cbs(struct task_struct *p)
 
 	BUG_ON(cbs != membership->cbs);
 
-	cbs_membership_del(membership, p);
+	cbs_membership_del(membership);
 	put_cbs(cbs);
 }
 
@@ -698,17 +746,23 @@ static void enqueue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
 	enqueue_dl_entity(cbs, flags);
 }
 
+static void __enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags,
+			      struct cbs_membership_entry *membership)
+{
+	struct sched_dl_entity *cbs = membership->cbs;
+
+	membership->entry_at_cbs = cbs_enqueue(p, cbs);
+
+	if (!on_dl_rq(cbs))
+		enqueue_cbs(rq, cbs, flags);
+}
+
 static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cbs_membership_entry *membership;
 
 	cbs_membership_for_each(membership, p) {
-		struct sched_dl_entity *cbs = membership->cbs;
-
-		membership->entry_at_cbs = cbs_enqueue(p, cbs);
-
-		if (!on_dl_rq(cbs))
-			enqueue_cbs(rq, cbs, flags);
+		__enqueue_task_dl(rq, p, flags, membership);
 	}
 }
 
@@ -717,6 +771,20 @@ static void dequeue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
 	dequeue_dl_entity(cbs);
 }
 
+static void __dequeue_task_dl(struct rq *rq, int flags,
+			      struct cbs_membership_entry *membership)
+{
+	struct sched_dl_entity *cbs = membership->cbs;
+
+	cbs_dequeue(membership->entry_at_cbs, cbs);
+	membership->entry_at_cbs = NULL;
+
+	if (cbs_queue_empty(cbs))
+		dequeue_cbs(rq, cbs, flags);
+}
+
+static void __bwi_take_back_server(struct bwi_history_entry *hist_entry);
+
 static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cbs_membership_entry *membership;
@@ -724,16 +792,15 @@ static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 	update_curr_dl(rq);
 
 	cbs_membership_for_each(membership, p) {
-		struct sched_dl_entity *cbs = membership->cbs;
-
-		cbs_dequeue(membership->entry_at_cbs, cbs);
-		membership->entry_at_cbs = NULL;
-
-		if (cbs_queue_empty(cbs))
-			dequeue_cbs(rq, cbs, flags);
+		__dequeue_task_dl(rq, flags, membership);
 	}
 
 	if (unlikely(p->state == TASK_DEAD)) {
+		struct bwi_history_entry *hist_entry, *hist_next;
+
+		bwi_history_for_each_safe(hist_entry, hist_next, p)
+			__bwi_take_back_server(hist_entry);
+
 		disassociate_task_and_all_cbs(p);
 	}
 }
@@ -1027,3 +1094,206 @@ static const struct sched_class dl_sched_class = {
 	.switched_to		= switched_to_dl,
 };
 
+static struct bwi_history_entry *bwi_history_add(struct task_struct *desc,
+						 struct task_struct *p)
+{
+	struct cbs_membership_entry *first_membership = cbs_membership_first(p);
+	struct bwi_history_entry *entry;
+
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry->desc = desc;
+	entry->has_inherited_hosted_cbs = (first_membership != NULL
+					   && &p->dl == first_membership->cbs);
+	INIT_LIST_HEAD(&entry->bwi_chains);
+	if (list_empty(&p->dl.bwi_history)) {
+		entry->id = 0;
+	} else {
+		entry->id = (container_of(p->dl.bwi_history.prev,
+					  struct bwi_history_entry, node)->id
+			     + 1);
+	}
+
+	list_add_tail(&entry->node, &p->dl.bwi_history);
+
+	return entry;
+}
+
+static void bwi_history_del(struct bwi_history_entry *hist_entry)
+{
+	BUG_ON(!list_empty(&hist_entry->bwi_chains));
+
+	list_del(&hist_entry->node);
+	kfree(hist_entry);
+}
+
+static void bwi_extender(struct task_struct *parent, int count,
+			 struct bwi_history_entry *hist_entry)
+{
+	struct cbs_membership_entry *membership;
+
+	cbs_membership_for_each_reverse(membership, parent) {
+		struct cbs_membership_entry *e;
+
+		if (count-- == 0)
+			return;
+
+		e = associate_task_and_cbs(hist_entry->desc, membership->cbs);
+		list_add_tail(&e->chain_node, &hist_entry->bwi_chains);
+		list_add_tail(&e->downstream_node, &membership->downstreams);
+
+		if (hist_entry->desc->se.on_rq) {
+			struct rq *rq = task_rq(hist_entry->desc);
+			int cbs_on_rq = on_dl_rq(e->cbs);
+
+			__enqueue_task_dl(rq, hist_entry->desc, 0, e);
+
+			if (!cbs_on_rq)
+				check_preempt_curr_cbs(rq, e->cbs, 0);
+		}
+		/* TODO: In SMP, think about when hist_entry->desc is running */
+	}
+}
+
+static void bwi_shortener(struct cbs_membership_entry *membership)
+{
+	BUG_ON(!list_empty(&membership->downstreams));
+
+	list_del_init(&membership->chain_node);
+
+	if (!list_empty(&membership->downstream_node))
+		list_del_init(&membership->downstream_node);
+
+	if (membership->entry_at_cbs != NULL) {
+		struct rq *rq = task_rq(membership->entry_at_cbs->task);
+
+		__dequeue_task_dl(rq, 0, membership);
+	}
+
+	cbs_membership_del(membership);
+}
+
+static int bwi_bft(unsigned depth, struct task_struct *parent, int count)
+{
+	int processed_task_count = 0;
+	struct bwi_history_entry *hist_entry;
+
+	if (depth == 0) {
+		/* Recursion base case */
+		bwi_history_for_each(hist_entry, parent) {
+			bwi_extender(parent, count, hist_entry);
+			processed_task_count++;
+		}
+
+	} else {
+		bwi_history_for_each(hist_entry, parent) {
+			processed_task_count += bwi_bft(depth - 1,
+							hist_entry->desc,
+							count);
+		}
+	}
+
+	return processed_task_count;
+}
+
+static void bwi_dft(struct cbs_membership_entry *parent)
+{
+	struct cbs_membership_entry *membership, *next;
+
+	list_for_each_entry_safe(membership, next, &parent->downstreams,
+				 downstream_node)
+	{
+		if (!list_empty(&membership->downstreams))
+			bwi_dft(membership);
+
+		bwi_shortener(membership);
+	}
+}
+
+static void
+bwi_give_server_direct(struct task_struct *parent,
+		       struct bwi_history_entry *parent_hist_entry,
+		       struct cbs_membership_entry *parent_membership,
+		       struct task_struct *direct_desc)
+{
+	struct cbs_membership_entry *e;
+
+	e = associate_task_and_cbs(direct_desc, parent_membership->cbs);
+	list_add_tail(&e->chain_node, &parent_hist_entry->bwi_chains);
+
+	if (!task_hosts_cbs(parent, parent_membership->cbs))
+		list_add_tail(&e->downstream_node,
+			      &parent_membership->downstreams);
+}
+
+static void bwi_give_server_indirect(struct task_struct *direct_desc, int count)
+{
+	int depth = 0;
+
+	while (bwi_bft(depth, direct_desc, count) != 0)
+		depth++;
+}
+
+int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
+		    int *key)
+{
+	struct cbs_membership_entry *membership;
+	struct bwi_history_entry *hist_entry;
+	int count = 0;
+
+	if (cbs_membership_empty(giver)) /* BWI requires at least one CBS */
+		return -EAGAIN;
+
+	/* TODO: prevent circular BWI by setting up parent chain */
+
+	hist_entry = bwi_history_add(recvr, giver);
+	*key = hist_entry->id;
+
+	cbs_membership_for_each(membership, giver) {
+		bwi_give_server_direct(giver, hist_entry, membership, recvr);
+		count++;
+	}
+
+	bwi_give_server_indirect(recvr, count);
+
+	return 0;
+}
+
+static void __bwi_take_back_server(struct bwi_history_entry *hist_entry)
+{
+	struct cbs_membership_entry *entry_at_desc, *next;
+
+	list_for_each_entry_safe(entry_at_desc, next, &hist_entry->bwi_chains,
+				 chain_node) {
+
+		bwi_dft(entry_at_desc);
+		bwi_shortener(entry_at_desc);
+	}
+
+	bwi_history_del(hist_entry);
+}
+
+int bwi_take_back_server(struct task_struct *taker, int key)
+{
+	struct bwi_history_entry *hist_entry, *hist_next;
+	int found = 0;
+
+	bwi_history_for_each_safe(hist_entry, hist_next, taker) {
+		/*
+		 * There can be more than one hist_entry with the same ID but
+		 * they are always clustered together.
+		 */
+		if (hist_entry->id == key) {
+			if (!found)
+				found = 1;
+
+			__bwi_take_back_server(hist_entry);
+
+		} else if (found)
+			break;
+	}
+
+	if (!found)
+		return -EINVAL;
+
+	return 0;
+}

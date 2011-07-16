@@ -1311,7 +1311,7 @@ struct sched_dl_entity {
 	 * Once this hits zero, this CBS should be cleaned up because there is
 	 * no way for any other task to use this CBS. The only way this number
 	 * can increase is when a member of this CBS gives this CBS to another
-	 * task.
+	 * task and when the task hosting this CBS becomes a SCHED_DL task.
 	 */
 	int nr_task;
 
@@ -1349,9 +1349,18 @@ struct sched_dl_entity {
 	int nr_cpus_allowed;
 
 	/*
-	 * List of CBSes that this DL task is a member of.
+	 * List of CBSes that this DL task is a member of. If the head of this
+	 * list is the CBS hosted by this task, it means that this task is a
+	 * normal DL task. Otherwise, this task is a DL task due to BWI
+	 * (Bandwidth Inheritance). As long as this list is not empty, a task
+	 * can give its CBSes as an inheritance to other tasks.
 	 */
 	struct list_head cbs_membership;
+
+	/*
+	 * Record the history of calls to fn bwi_give_server.
+	 */
+	struct list_head bwi_history;
 
 	/*
 	 * The CBS existing in cbs_membership that this task is using for
@@ -1363,26 +1372,156 @@ struct sched_dl_entity {
 	/*
 	 * This list contains CBSes that should be destroyed without holding
 	 * rq->lock and by using fn hrtimer_cancel to defuse its dl_timer.
+	 * The CBS hosted by this task is always enqueued at the head of this
+	 * list.
 	 */
 	struct list_head cbs_gc_list;
 	/* -- 8< -- End of CBS task ----------------------------------------- */
 
 	/*
-	 * NOTE: cbs_queue, nr_task, cbs_membership and effective_cbs are the
-	 * fields that should be made SMP safe when a task can be enqueued in
-	 * CBSes that are enqueued in the dl_rqs of other CPUs.
+	 * NOTE: cbs_queue, nr_task, gc_node, cbs_rq, cbs_membership,
+	 * bwi_history, effective_cbs and cbs_gc_list are the fields that
+	 * should be made SMP safe when a task can be enqueued in CBSes that
+	 * are enqueued in the dl_rqs of other CPUs.
 	 */
 };
 
+/*
+ * A cbs_queue_entry is created when a task is enqueued at a CBS and destroyed
+ * when the task is dequeued from the CBS.
+ *
+ * A newly born task (i.e., forked) is activated (i.e., enqueued at the
+ * runqueue of the parent's scheduling class) using fn wake_up_new_task. Such
+ * a task will not be enqueued to any CBS except when the parent is a SCHED_DL
+ * task (i.e., the parent is associated with the CBS hosted by the
+ * parent). When the parent is a SCHED_DL task, the newly born task will also
+ * be a SCHED_DL task (i.e., the newly born task is also associated with the
+ * CBS it hosts), and therefore, the newly born task will be enqueued to its
+ * own CBS when fn wake_up_new_task activates the task. This shows that the
+ * parent's BWI does not extend to the forked task.
+ *
+ * When a task blocks, it will be dequeued from all of its associated
+ * CBSes. When the task unblocks, it will be enqueued to all of its associated
+ * CBSes.
+ *
+ * When a task dies, it will be dequeued from all of its associated
+ * CBSes. This takes out the dying task from the BWI chains.
+ *
+ * When a task changes its scheduling policy to SCHED_DL and it was in the rq
+ * of the old scheduling class, the task will be enqueued to its own CBS. This
+ * will preserve BWI because the cbs_queue_entry of the task in the other
+ * inherited CBSes will not be touched.
+ *
+ * When a task changes its scheduling policy to something other than SCHED_DL
+ * and it was in the SCHED_DL rq, the task will be dequeued from its own
+ * CBS. This will preserve BWI because the cbs_queue_entry of the task in the
+ * other inherited CBSes will not be touched. Moreover, the hosted CBS can
+ * still serve the other tasks enqueued through BWI because the queue of the
+ * hosted CBS is not touched.
+ */
 struct cbs_queue_entry {
 	struct list_head node;
+
+	/*
+	 * The field task must never be NULL as long as this cbs_queue_entry
+	 * is queued at a CBS.
+	 */
 	struct task_struct *task;
 };
 
+/*
+ * A cbs_membership_entry is created when a task is associated with a CBS
+ * (i.e., the task is made eligible to run using the CBS) and is destroyed
+ * when a task is disassociated from the CBS.
+ *
+ * When a task is forked, it is not associated with any CBS except when the
+ * parent is a SCHED_DL task. When the parent is a SCHED_DL task, the newly
+ * forked task will be associated with its own hosted CBS. This means that BWI
+ * that the parent has does not extend to the forked task.
+ *
+ * All cbs_membership_entry in a task's cbs_membership list is obtained
+ * through BWI except when the task is a SCHED_DL task. One
+ * cbs_membership_entry in the cbs_membership list of a SCHED_DL task is not
+ * obtained through BWI and the entry associates the task with the hosted
+ * CBS.
+ *
+ * The non-BWI cbs_membership_entry is created for a newly forked SCHED_DL
+ * task or when a task changes its scheduling policy to SCHED_DL.
+ *
+ * The non-BWI cbs_membership_entry is destroyed when a SCHED_DL task dies or
+ * when a SCHED_DL task changes its scheduling policy to something other than
+ * SCHED_DL.
+ *
+ * A BWI cbs_membership_entry is created when this task is affected by fn
+ * bwi_give_server. That is, either another task invokes bwi_give_server on
+ * this task, or this task has been in a BWI chain and one of its ancestor
+ * inherits more CBSes, or this task has been in a BWI chain and one of its
+ * ancestor changes its scheduling policy to SCHED_DL activating the CBS
+ * hosted by the ancestor.
+ *
+ * A BWI cbs_membership_entry is destroyed when this task is affected by fn
+ * bwi_take_back_server or when this task dies, but not when this task changes
+ * its scheduling policy to something other than SCHED_DL. Moreover, a BWI
+ * cbs_membership_entry is not destroyed when the associated ancestor dies or
+ * changes its scheduling policy to something other than SCHED_DL.
+ */
 struct cbs_membership_entry {
 	struct list_head node;
+
+	/*
+	 * The field cbs must never be NULL as long as this
+	 * cbs_membership_entry is listed in a task's cbs_membership list.
+	 */
 	struct sched_dl_entity *cbs;
+
+	/*
+	 * The field entry_at_cbs is NULL when this task is not queued at the
+	 * CBS. Otherwise, the task is queued at the CBS.
+	 */
 	struct cbs_queue_entry *entry_at_cbs;
+
+	/*
+	 * The following three fields are used to quickly perform
+	 * bwi_take_back_server.
+	 */
+	struct list_head downstreams;
+	struct list_head chain_node;
+	struct list_head downstream_node;
+};
+
+/*
+ * A bwi_history_entry can only be created and listed at the caller's
+ * bwi_history list through fn bwi_give_server and can only be removed from
+ * the caller's bwi_history list and destroyed through fn
+ * bwi_take_back_server or when the task dies.
+ */
+struct bwi_history_entry {
+	struct list_head node;
+
+	/*
+	 * This is used to perform bwi_take_back_server to identify the
+	 * correct bwi to be revoked.
+	 */
+	int id;
+
+	/*
+	 * This is used to quickly extend a BWI chain.
+	 */
+	struct task_struct *desc;
+
+	/*
+	 * This is non-zero if the task owning this entry has already
+	 * inherited its hosted CBS through this BWI chain.
+	 */
+	int has_inherited_hosted_cbs;
+
+	/*
+	 * This is used to quickly perform bwi_take_back_server by which the
+	 * caller wants to discard the direct descendant. This is also the
+	 * entry point to discard the indirect descendants obtained through
+	 * the direct descendant to be discarded.
+	 */
+	struct list_head bwi_chains;
 };
 
 struct rcu_node;
