@@ -18,28 +18,202 @@
  * runqueue lock to be held and irq is disabled (i.e., no preemption too).
  */
 
+static int dl_time_before(u64 a, u64 b) __attribute__((__noinline__));
+static struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
+	__attribute__((__noinline__));
+static struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static int on_dl_rq(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static int task_hosts_cbs(struct task_struct *p, struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static struct sched_dl_entity *effective_cbs(struct task_struct *p)
+	__attribute__((__noinline__));
+static void set_effective_cbs(struct task_struct *p,
+			      struct sched_dl_entity *effective_cbs)
+	__attribute__((__noinline__));
+static void zap_effective_cbs(struct task_struct *p)
+	__attribute__((__noinline__));
+static void get_cbs(struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static void put_cbs(struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static struct task_struct *cbs_queue_head(struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static int cbs_queue_empty(struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static struct cbs_queue_entry *cbs_enqueue(struct task_struct *p,
+					   struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static void cbs_dequeue(struct cbs_queue_entry *entry,
+			struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static struct cbs_membership_entry *
+cbs_membership_add(struct sched_dl_entity *cbs, struct task_struct *p,
+		   int to_head)
+	__attribute__((__noinline__));
+static void cbs_membership_del(struct cbs_membership_entry *membership)
+	__attribute__((__noinline__));
+static struct cbs_membership_entry *cbs_membership_first(struct task_struct *p)
+	__attribute__((__noinline__));
+static struct cbs_membership_entry *cbs_membership_last(struct task_struct *p)
+	__attribute__((__noinline__));
+static int cbs_membership_empty(struct task_struct *p)
+	__attribute__((__noinline__));
+static struct cbs_membership_entry *
+associate_task_and_cbs(struct task_struct *p, struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static void disassociate_task_and_cbs(struct task_struct *p,
+				      struct cbs_membership_entry *membership)
+	__attribute__((__noinline__));
+static void disassociate_task_and_all_cbs(struct task_struct *p)
+	__attribute__((__noinline__));
+void associate_task_and_its_cbs(struct task_struct *p)
+	__attribute__((__noinline__));
+void disassociate_task_and_its_cbs(struct task_struct *p)
+	__attribute__((__noinline__));
+static struct rq *cbs_rq_lock(struct sched_dl_entity *cbs, unsigned long *flags)
+	__acquires(rq->lock) __attribute__((__noinline__));
+static void cbs_rq_unlock(struct rq *rq, unsigned long *flags)
+	__releases(rq->lock) __attribute__((__noinline__));
+static void setup_new_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static void replenish_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static bool dl_entity_overflow(struct sched_dl_entity *dl_se, u64 t)
+	__attribute__((__noinline__));
+static void update_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static int start_dl_timer(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
+	__attribute__((__noinline__));
+static void init_dl_task_timer(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static int dl_runtime_exceeded(struct rq *rq, struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static void update_curr_dl(struct rq *rq) __attribute__((__noinline__));
+static void __enqueue_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static void __dequeue_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static void
+enqueue_dl_entity(struct sched_dl_entity *dl_se, int flags)
+	__attribute__((__noinline__));
+static void dequeue_dl_entity(struct sched_dl_entity *dl_se)
+	__attribute__((__noinline__));
+static void enqueue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
+	__attribute__((__noinline__));
+static void __enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags,
+			      struct cbs_membership_entry *membership)
+	__attribute__((__noinline__));
+static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+	__attribute__((__noinline__));
+static void dequeue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags)
+	__attribute__((__noinline__));
+static void __dequeue_task_dl(struct rq *rq, int flags,
+			      struct cbs_membership_entry *membership)
+	__attribute__((__noinline__));
+static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+	__attribute__((__noinline__));
+static void yield_task_dl(struct rq *rq) __attribute__((__noinline__));
+static int should_preempt_curr(struct task_struct *curr,
+			       struct sched_dl_entity *cbs)
+	__attribute__((__noinline__));
+static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
+				   int flags) __attribute__((__noinline__));
+static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
+				  int flags) __attribute__((__noinline__));
+#ifdef CONFIG_SCHED_HRTICK
+static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
+	__attribute__((__noinline__));
+#else
+static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
+	__attribute__((__always_inline__));
+#endif
+static struct sched_dl_entity *pick_next_dl_entity(struct rq *rq,
+						   struct dl_rq *dl_rq)
+	__attribute__((__noinline__));
+struct task_struct *pick_next_task_dl(struct rq *rq)
+	__attribute__((__noinline__));
+static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
+	__attribute__((__noinline__));
+static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
+	__attribute__((__noinline__));
+static void task_fork_dl(struct task_struct *p) __attribute__((__noinline__));
+void run_cbs_gc(struct task_struct *p) __attribute__((__noinline__));
+static void task_dead_dl(struct task_struct *p) __attribute__((__noinline__));
+static void set_curr_task_dl(struct rq *rq) __attribute__((__noinline__));
+static void switched_from_dl(struct rq *rq, struct task_struct *p,
+			     int running) __attribute__((__noinline__));
+static void switched_to_dl(struct rq *rq, struct task_struct *p,
+			   int running) __attribute__((__noinline__));
+static void prio_changed_dl(struct rq *rq, struct task_struct *p,
+			    int oldprio, int running)
+	__attribute__((__noinline__));
+#ifdef CONFIG_SMP
+static int
+select_task_rq_dl(struct rq *rq, struct task_struct *p, int sd_flag, int flags)
+	__attribute__((__noinline__));
+static void set_cpus_allowed_dl(struct task_struct *p,
+				const struct cpumask *new_mask)
+	__attribute__((__noinline__));
+#endif
+static struct bwi_history_entry *bwi_history_add(struct task_struct *desc,
+						 struct task_struct *p)
+	__attribute__((__noinline__));
+static void bwi_history_del(struct bwi_history_entry *hist_entry)
+	__attribute__((__noinline__));
+static void bwi_extender(struct task_struct *parent, int count,
+			 struct bwi_history_entry *hist_entry)
+	__attribute__((__noinline__));
+static void bwi_shortener(struct cbs_membership_entry *membership)
+	__attribute__((__noinline__));
+static int bwi_bft(unsigned depth, struct task_struct *parent, int count)
+	__attribute__((__noinline__));
+static void bwi_dft(struct cbs_membership_entry *parent)
+	__attribute__((__noinline__));
+static void
+bwi_give_server_direct(struct task_struct *parent,
+		       struct bwi_history_entry *parent_hist_entry,
+		       struct cbs_membership_entry *parent_membership,
+		       struct task_struct *direct_desc)
+	__attribute__((__noinline__));
+static void bwi_give_server_indirect(struct task_struct *direct_desc,
+				     int count) __attribute__((__noinline__));
+int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
+		    int *key) __attribute__((__noinline__));
+static void __bwi_take_back_server(struct bwi_history_entry *hist_entry)
+	__attribute__((__noinline__));
+int bwi_take_back_server(struct task_struct *taker, int key)
+	__attribute__((__noinline__));
+static void bwi_setprio(struct task_struct *p, int prio)
+	__attribute__((__noinline__));
+
 #ifdef CONFIG_SCHED_HRTICK
 /* The following is in nanosecond */
 #define SCHED_HRTICK_SMALLEST 10000
 #endif
 
-static inline int dl_time_before(u64 a, u64 b)
+static int dl_time_before(u64 a, u64 b)
 {
 	return (s64)(a - b) < 0;
 }
 
 /* Return the task that hosts the CBS. */
-static inline struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
+static struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
 {
 	return container_of(dl_se, struct task_struct, dl);
 }
 
-static inline struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
+static struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
 {
 	return container_of(dl_rq, struct rq, dl);
 }
 
-static inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
+static struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
 {
 	struct task_struct *p = dl_task_of(dl_se);
 	struct rq *rq = task_rq(p);
@@ -47,16 +221,10 @@ static inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
 	return &rq->dl;
 }
 
-static inline int on_dl_rq(struct sched_dl_entity *dl_se)
+static int on_dl_rq(struct sched_dl_entity *dl_se)
 {
 	return !RB_EMPTY_NODE(&dl_se->rb_node);
 }
-
-static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
-static void enqueue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags);
-static void dequeue_cbs(struct rq *rq, struct sched_dl_entity *cbs, int flags);
-static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
-				   int flags);
 
 /* Iterate the membership list of a task. */
 #define cbs_membership_for_each(pos, p)				\
@@ -79,33 +247,32 @@ static void check_preempt_curr_cbs(struct rq *rq, struct sched_dl_entity *cbs,
 	list_for_each_entry_safe(pos, n, &p->dl.bwi_history, node)
 
 /* Return non-zero if the CBS is the task's hosted CBS. */
-static inline int task_hosts_cbs(struct task_struct *p,
-				 struct sched_dl_entity *dl_se)
+static int task_hosts_cbs(struct task_struct *p, struct sched_dl_entity *dl_se)
 {
 	return (p == dl_task_of(dl_se));
 }
 
 /* Return the task's effective CBS. */
-static inline struct sched_dl_entity *effective_cbs(struct task_struct *p)
+static struct sched_dl_entity *effective_cbs(struct task_struct *p)
 {
 	return p->dl.effective_cbs;
 }
 
 /* Set the task's effective CBS. */
-static inline void set_effective_cbs(struct task_struct *p,
-				     struct sched_dl_entity *effective_cbs)
+static void set_effective_cbs(struct task_struct *p,
+			      struct sched_dl_entity *effective_cbs)
 {
 	p->dl.effective_cbs = effective_cbs;
 }
 
 /* Nullify the task's effective CBS. */
-static inline void zap_effective_cbs(struct task_struct *p)
+static void zap_effective_cbs(struct task_struct *p)
 {
 	p->dl.effective_cbs = NULL;
 }
 
 /* Increment the CBS refcount. */
-static inline void get_cbs(struct sched_dl_entity *cbs)
+static void get_cbs(struct sched_dl_entity *cbs)
 {
 	if (cbs->nr_task == 0
 	    && !list_empty(&current->dl.cbs_gc_list)
@@ -126,7 +293,7 @@ static inline void get_cbs(struct sched_dl_entity *cbs)
  * Decrement the CBS refcount. If the refcount is zero, the CBS should be
  * assumed to have been destroyed.
  */
-static inline void put_cbs(struct sched_dl_entity *cbs)
+static void put_cbs(struct sched_dl_entity *cbs)
 {
 	BUG_ON(cbs->nr_task == 0);
 
@@ -159,7 +326,7 @@ static struct task_struct *cbs_queue_head(struct sched_dl_entity *cbs)
 /*
  * Return non-zero if the CBS queue is empty. Otherwise, return zero.
  */
-static inline int cbs_queue_empty(struct sched_dl_entity *cbs)
+static int cbs_queue_empty(struct sched_dl_entity *cbs)
 {
 	return list_empty(&cbs->cbs_queue);
 }
@@ -228,8 +395,7 @@ static void cbs_membership_del(struct cbs_membership_entry *membership)
  * Return the first entry of the membership list. NULL is returned if
  * the membership list is empty.
  */
-static inline struct cbs_membership_entry *
-cbs_membership_first(struct task_struct *p)
+static struct cbs_membership_entry *cbs_membership_first(struct task_struct *p)
 {
 	struct list_head *hd = &p->dl.cbs_membership;
 
@@ -243,8 +409,7 @@ cbs_membership_first(struct task_struct *p)
  * Return the last entry added to the membership list. NULL is
  * returned if the membership list is empty.
  */
-static inline struct cbs_membership_entry *
-cbs_membership_last(struct task_struct *p)
+static struct cbs_membership_entry *cbs_membership_last(struct task_struct *p)
 {
 	struct list_head *hd = &p->dl.cbs_membership;
 
@@ -255,7 +420,7 @@ cbs_membership_last(struct task_struct *p)
 }
 
 /* Return non-zero if the CBS membership entry of a task is empty. */
-static inline int cbs_membership_empty(struct task_struct *p)
+static int cbs_membership_empty(struct task_struct *p)
 {
 	return list_empty(&p->dl.cbs_membership);
 }
@@ -300,14 +465,6 @@ static void disassociate_task_and_all_cbs(struct task_struct *p)
 	}
 }
 
-static void
-bwi_give_server_direct(struct task_struct *parent,
-		       struct bwi_history_entry *parent_hist_entry,
-		       struct cbs_membership_entry *parent_membership,
-		       struct task_struct *direct_desc);
-static void bwi_give_server_indirect(struct task_struct *direct_desc,
-				     int count);
-
 void associate_task_and_its_cbs(struct task_struct *p)
 {
 	struct cbs_membership_entry *membership;
@@ -338,8 +495,7 @@ void disassociate_task_and_its_cbs(struct task_struct *p)
 	put_cbs(cbs);
 }
 
-static inline struct rq *cbs_rq_lock(struct sched_dl_entity *cbs,
-				     unsigned long *flags)
+static struct rq *cbs_rq_lock(struct sched_dl_entity *cbs, unsigned long *flags)
 	__acquires(rq->lock)
 {
 	struct rq *rq = cbs->cbs_rq;
@@ -349,8 +505,7 @@ static inline struct rq *cbs_rq_lock(struct sched_dl_entity *cbs,
 	return rq;
 }
 
-static inline void cbs_rq_unlock(struct rq *rq,
-				 unsigned long *flags)
+static void cbs_rq_unlock(struct rq *rq, unsigned long *flags)
 	__releases(rq->lock)
 {
 	raw_spin_unlock_irqrestore(&rq->lock, *flags);
@@ -368,7 +523,7 @@ static inline void cbs_rq_unlock(struct rq *rq,
  * one, and to (try to!) reconcile itself with its own scheduling
  * parameters.
  */
-static inline void setup_new_dl_entity(struct sched_dl_entity *dl_se)
+static void setup_new_dl_entity(struct sched_dl_entity *dl_se)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
 	struct rq *rq = rq_of_dl_rq(dl_rq);
@@ -783,8 +938,6 @@ static void __dequeue_task_dl(struct rq *rq, int flags,
 		dequeue_cbs(rq, cbs, flags);
 }
 
-static void __bwi_take_back_server(struct bwi_history_entry *hist_entry);
-
 static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cbs_membership_entry *membership;
@@ -834,8 +987,8 @@ static void yield_task_dl(struct rq *rq)
 	update_curr_dl(rq);
 }
 
-static inline int should_preempt_curr(struct task_struct *curr,
-				      struct sched_dl_entity *cbs)
+static int should_preempt_curr(struct task_struct *curr,
+			       struct sched_dl_entity *cbs)
 {
 	return (!dl_task(curr)
 		|| (dl_time_before(cbs->deadline,
@@ -1233,6 +1386,44 @@ static void bwi_give_server_indirect(struct task_struct *direct_desc, int count)
 		depth++;
 }
 
+static inline void check_class_changed(struct rq *rq, struct task_struct *p,
+				       const struct sched_class *prev_class,
+				       int oldprio, int running);
+static inline int normal_prio(struct task_struct *p);
+
+static void bwi_setprio(struct task_struct *p, int prio)
+{
+	int oldprio, on_rq, running;
+	struct rq *rq = this_rq();
+	const struct sched_class *prev_class;
+
+	oldprio = p->prio;
+	prev_class = p->sched_class;
+	on_rq = p->se.on_rq;
+	running = task_current(rq, p);
+	if (on_rq)
+		dequeue_task(rq, p, 0);
+	if (running)
+		p->sched_class->put_prev_task(rq, p);
+
+	if (dl_prio(prio))
+		p->sched_class = &dl_sched_class;
+	else if (rt_prio(prio))
+		p->sched_class = &rt_sched_class;
+	else
+		p->sched_class = &fair_sched_class;
+
+	p->prio = prio;
+
+	if (running)
+		p->sched_class->set_curr_task(rq);
+	if (on_rq) {
+		enqueue_task(rq, p, oldprio < prio ? ENQUEUE_HEAD : 0);
+
+		check_class_changed(rq, p, prev_class, oldprio, running);
+	}
+}
+
 int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
 		    int *key)
 {
@@ -1254,6 +1445,8 @@ int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
 	}
 
 	bwi_give_server_indirect(recvr, count);
+
+	bwi_setprio(recvr, MAX_DL_PRIO-1);
 
 	return 0;
 }
@@ -1283,10 +1476,13 @@ int bwi_take_back_server(struct task_struct *taker, int key)
 		 * they are always clustered together.
 		 */
 		if (hist_entry->id == key) {
+			struct task_struct *p = hist_entry->desc;
+
 			if (!found)
 				found = 1;
 
 			__bwi_take_back_server(hist_entry);
+			bwi_setprio(p, normal_prio(p));
 
 		} else if (found)
 			break;
