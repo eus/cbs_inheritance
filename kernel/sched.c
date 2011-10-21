@@ -5811,6 +5811,15 @@ again:
 		goto out;
 	}
 
+	/* Cannot migrate when giving/under BWI */
+	if (!cpumask_test_cpu(task_cpu(p), new_mask)
+	    && ((!cbs_membership_empty(p)
+		 && !task_hosts_cbs(p, cbs_membership_last(p)->cbs))
+		|| !bwi_history_empty(p))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	if (p->sched_class->set_cpus_allowed)
 		p->sched_class->set_cpus_allowed(p, new_mask);
 	else {

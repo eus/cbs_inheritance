@@ -246,6 +246,14 @@ static int on_dl_rq(struct sched_dl_entity *dl_se)
 #define bwi_history_for_each_safe(pos, n, p)				\
 	list_for_each_entry_safe(pos, n, &p->dl.bwi_history, node)
 
+/*
+ * Return non-zero if the BWI history is empty. Otherwise, return zero.
+ */
+static int bwi_history_empty(struct task_struct *p)
+{
+	return list_empty(&p->dl.bwi_history);
+}
+
 /* Return non-zero if the CBS is the task's hosted CBS. */
 static int task_hosts_cbs(struct task_struct *p, struct sched_dl_entity *dl_se)
 {
@@ -1433,6 +1441,9 @@ int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
 
 	if (cbs_membership_empty(giver)) /* BWI requires at least one CBS */
 		return -EAGAIN;
+
+	if (task_cpu(giver) != task_cpu(recvr)) /* Partitioned scheduling */
+		return -EINVAL;
 
 	/* TODO: prevent circular BWI by setting up parent chain */
 
