@@ -178,8 +178,7 @@ static void bwi_dft(struct cbs_membership_entry *parent)
 static void
 bwi_give_server_direct(struct task_struct *parent,
 		       struct bwi_history_entry *parent_hist_entry,
-		       struct cbs_membership_entry *parent_membership,
-		       struct task_struct *direct_desc)
+		       struct cbs_membership_entry *parent_membership)
 	__attribute__((__noinline__));
 static void bwi_give_server_indirect(struct task_struct *direct_desc,
 				     int count) __attribute__((__noinline__));
@@ -484,8 +483,7 @@ void associate_task_and_its_cbs(struct task_struct *p)
 
 	bwi_history_for_each(hist_entry, p) {
 		if (!hist_entry->has_inherited_hosted_cbs) {
-			bwi_give_server_direct(p, hist_entry, membership,
-					       hist_entry->desc);
+			bwi_give_server_direct(p, hist_entry, membership);
 			bwi_give_server_indirect(hist_entry->desc, 1);
 			hist_entry->has_inherited_hosted_cbs = 1;
 		}
@@ -1373,10 +1371,10 @@ static void bwi_dft(struct cbs_membership_entry *parent)
 static void
 bwi_give_server_direct(struct task_struct *parent,
 		       struct bwi_history_entry *parent_hist_entry,
-		       struct cbs_membership_entry *parent_membership,
-		       struct task_struct *direct_desc)
+		       struct cbs_membership_entry *parent_membership)
 {
 	struct cbs_membership_entry *e;
+	struct task_struct *direct_desc = parent_hist_entry->desc;
 
 	e = associate_task_and_cbs(direct_desc, parent_membership->cbs);
 	list_add_tail(&e->chain_node, &parent_hist_entry->bwi_chains);
@@ -1384,6 +1382,28 @@ bwi_give_server_direct(struct task_struct *parent,
 	if (!task_hosts_cbs(parent, parent_membership->cbs))
 		list_add_tail(&e->downstream_node,
 			      &parent_membership->downstreams);
+
+	/*
+	 * If the direct descendant is not a sched_dl task,
+	 * bwi_setprio will take care of necessary enqueuement if the
+	 * direct descendant is on rq.
+	 */
+	if (!dl_prio(direct_desc->prio))
+		return;
+
+	/*
+	 * bwi_setprio will do nothing if direct descendant is a
+	 * sched_dl task. So, we need to take care of the enqueuement.
+	 */
+	if (direct_desc->se.on_rq) {
+		struct rq *rq = task_rq(direct_desc);
+		int cbs_on_rq = on_dl_rq(e->cbs);
+
+		__enqueue_task_dl(rq, direct_desc, 0, e);
+
+		if (!cbs_on_rq)
+			check_preempt_curr_cbs(rq, e->cbs, 0);
+	}
 }
 
 static void bwi_give_server_indirect(struct task_struct *direct_desc, int count)
@@ -1399,20 +1419,22 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 				       int oldprio, int running);
 static inline int normal_prio(struct task_struct *p);
 
+/* Currently must be used under partitioned scheduling assumption */
 static void bwi_setprio(struct task_struct *p, int prio)
 {
-	int oldprio, on_rq, running;
-	struct rq *rq = this_rq();
-	const struct sched_class *prev_class;
+	int oldprio = p->prio, on_rq = p->se.on_rq, running;
+	struct rq *rq = this_rq(); /* Afforded by partitioned scheduling */
+	const struct sched_class *prev_class = p->sched_class;
 
-	oldprio = p->prio;
-	prev_class = p->sched_class;
-	on_rq = p->se.on_rq;
-	running = task_current(rq, p);
+	if (oldprio == prio)
+		return;
+
+	/* In partitioned scheduling, the descendant cannot be running */
+	BUG_ON(task_current(rq, p));
+	running = 0;
+
 	if (on_rq)
 		dequeue_task(rq, p, 0);
-	if (running)
-		p->sched_class->put_prev_task(rq, p);
 
 	if (dl_prio(prio))
 		p->sched_class = &dl_sched_class;
@@ -1423,8 +1445,6 @@ static void bwi_setprio(struct task_struct *p, int prio)
 
 	p->prio = prio;
 
-	if (running)
-		p->sched_class->set_curr_task(rq);
 	if (on_rq) {
 		enqueue_task(rq, p, oldprio < prio ? ENQUEUE_HEAD : 0);
 
@@ -1451,7 +1471,7 @@ int bwi_give_server(struct task_struct *giver, struct task_struct *recvr,
 	*key = hist_entry->id;
 
 	cbs_membership_for_each(membership, giver) {
-		bwi_give_server_direct(giver, hist_entry, membership, recvr);
+		bwi_give_server_direct(giver, hist_entry, membership);
 		count++;
 	}
 
